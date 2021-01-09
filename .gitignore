@@ -1,2 +1,4 @@
 .idea/
+__pycache__/
 openbci*.tar
+jsons_from_wifi_shield.txt

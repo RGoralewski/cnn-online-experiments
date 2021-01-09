@@ -28,6 +28,12 @@ class CircularQueue:
             self.size -= 1
             return y
 
+    def get_window_of_data(self, window_length):
+        tmp = []
+        for i in range(window_length):
+            tmp.append(self.pop())
+        return np.concatenate(tmp)
+
     def get_size(self) -> int:
         return self.size
 

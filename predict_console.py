@@ -6,10 +6,34 @@ import numpy as np
 import base64
 import struct
 import sys
+from scipy import signal
+import torch
+
+from circular_queue import CircularQueue
+from put_emg_gestures_classification.pegc.models import Resnet1D
+from put_emg_gestures_classification.pegc import constants
+from put_emg_gestures_classification.pegc.training.utils import load_json
 
 BASE64_BYTES_PER_SAMPLE = 4
 SCALE_FACTOR_EMG = 4500000/24/(2**23-1)  # uV/count
 EMG_FREQUENCY = 1000  # Hz
+
+
+def filter_signals(s: np.ndarray, fs: int) -> np.ndarray:
+    # Highpass filter
+    fd = 10  # Hz
+    n_fd = fd / (fs / 2)  # normalized frequency
+    b, a = signal.butter(1, n_fd, 'highpass')
+    hp_filtered_signal = signal.lfilter(b, a, s.T)
+
+    # Notch filter
+    notch_filtered_signal = hp_filtered_signal  # cut off the beginning and transpose
+    for f0 in [50, 100, 200]:  # 50Hz and 100Hz notch filter
+        Q = 5  # quality factor
+        b, a = signal.iirnotch(f0, Q, fs)
+        notch_filtered_signal = signal.lfilter(b, a, notch_filtered_signal)
+
+    return notch_filtered_signal.T
 
 
 def base64_to_list_of_channels(encoded_data, bytes_per_sample):
@@ -36,6 +60,9 @@ def on_message(client, userdata, message):
     global model
     global window_length
 
+    global buffer
+    global model
+
     # Decode a message
     message_as_string = str(message.payload.decode("utf-8"))
     message_as_string = ''.join(message_as_string.split())  # remove all white characters
@@ -54,10 +81,29 @@ def on_message(client, userdata, message):
         if len(encoded_channels) == num_channels * BASE64_BYTES_PER_SAMPLE:
             channels_list = base64_to_list_of_channels(encoded_channels, BASE64_BYTES_PER_SAMPLE)
             scaled_data = np.asarray(channels_list).T * SCALE_FACTOR_EMG
-            # TODO save in buffer
+            # Save decoded data to the buffer
+            buffer.push(scaled_data)
 
     # If data for the window is collected
-    # TODO get data from buffer, filter it and predict (print model prediction)
+    if buffer.get_size() >= window_length:
+        start = time.time()
+        # get data from the buffer
+        data_from_buffer = buffer.get_window_of_data(window_length)
+        # filtering
+        expanded_data = np.concatenate((data_from_buffer,) * 3)  # triple data length for filtering
+        filtered_data = filter_signals(expanded_data, EMG_FREQUENCY)
+
+        # Transpose and expand dimension because CNN input=(batch, channels, data_window)
+        training_data = np.expand_dims(filtered_data[-200:].T, axis=0)
+        # predicting
+        with torch.no_grad():
+            y_pred = model(torch.Tensor(training_data))
+
+        # print time and loss
+        print('****************** '
+              f'Filtering and predicting time: {time.time() - start} '
+              f'PD: {gestures_classes[int(torch.argmax(y_pred))]} '
+              '******************')
 
 
 # MQTT data
@@ -69,11 +115,24 @@ topic = "sensors/emg/data"
 # File created flag
 file_created = False
 
-# TODO create circular buffer
+# Circular buffer
+buff_cap = 300
+buffer = CircularQueue(buff_cap)
 
-# TODO load model
+# Create specified model.
+training_config_file_path = "put_emg_gestures_classification/experiment_scripts/config_template.json"
+training_config = load_json(training_config_file_path)
+model = Resnet1D(constants.DATASET_FEATURES_SHAPE[0], constants.NB_DATASET_CLASSES,
+                 training_config["nb_res_blocks"], training_config["res_block_per_expansion"],
+                 training_config["base_feature_maps"])
 
-# TODO 3, 2, 1, start!
+# Load model and optimizer from checkpoint
+model_path = "openbci_third_trained_model.tar"
+checkpoint = torch.load(model_path)
+model.load_state_dict(checkpoint['model_state_dict'])
+
+# Ensure these layers are in evaluation mode
+model.eval()
 
 # Window length
 window_length = 200  # ms
