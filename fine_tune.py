@@ -1,55 +1,19 @@
 import paho.mqtt.client as mqtt
 import time
-import json
 import os
 import numpy as np
-import base64
-import struct
 import sys
 import torch
-from scipy import signal
 
-from circular_queue import CircularQueue
+# TODO remove put_emg_gestures submodule and add only pegc submodule
+
 from put_emg_gestures_classification.pegc.models import Resnet1D
 from put_emg_gestures_classification.pegc import constants
 from put_emg_gestures_classification.pegc.training.utils import load_json
-from pegc.training.lookahead import Lookahead
+from put_emg_gestures_classification.pegc.training.lookahead import Lookahead
 
-BASE64_BYTES_PER_SAMPLE = 4
-SCALE_FACTOR_EMG = 4500000/24/(2**23-1)  # uV/count
-EMG_FREQUENCY = 1000  # Hz
-
-
-def filter_signals(s: np.ndarray, fs: int) -> np.ndarray:
-    # Highpass filter
-    fd = 10  # Hz
-    n_fd = fd / (fs / 2)  # normalized frequency
-    b, a = signal.butter(1, n_fd, 'highpass')
-    hp_filtered_signal = signal.lfilter(b, a, s.T)
-
-    # Notch filter
-    notch_filtered_signal = hp_filtered_signal  # cut off the beginning and transpose
-    for f0 in [50, 100, 200]:  # 50Hz and 100Hz notch filter
-        Q = 5  # quality factor
-        b, a = signal.iirnotch(f0, Q, fs)
-        notch_filtered_signal = signal.lfilter(b, a, notch_filtered_signal)
-
-    return notch_filtered_signal.T
-
-
-def base64_to_list_of_channels(encoded_data, bytes_per_sample):
-    """Convert base64 string of samples (on each channel) to list of integers
-    """
-    output = list()
-    for i in range(int(len(encoded_data) / bytes_per_sample)):
-        # decode base64
-        sample_start = i * bytes_per_sample
-        decoded_bytes = base64.b64decode(encoded_data[sample_start:sample_start+bytes_per_sample])
-
-        # convert 24-bit signed int to 32-bit signed int
-        decoded = struct.unpack('>i', (b'\0' if decoded_bytes[0] < 128 else b'\xff') + decoded_bytes)
-        output.append(decoded)
-    return output
+from emg.emglimbo import EMG_Preprocessor
+from emg.emglimbo import constants
 
 
 def on_message(client, userdata, message):
@@ -58,16 +22,14 @@ def on_message(client, userdata, message):
     # ***** GLOBAL VARIABLES NIGHTMARE *****
     global file_created
     global script_start_time
-    global last_sampling_rate_print_time
-    global samples_counter
 
     global gestures_classes
     global current_gesture_idx
     global current_gesture_start_time
     global gest_duration
     global time_for_gest_change
-    global window_length
 
+    global preprocessor
     global buffer
     global model
     global optimizer
@@ -88,6 +50,29 @@ def on_message(client, userdata, message):
             print("Recording ends, unsubscribing...")
             client.loop_stop()
 
+
+            # TODO do fine tuning in the end -> epochs, test and validation dataset, etc.
+
+
+            # fine tuning
+            y_pred = model(torch.Tensor(training_data))
+            y = torch.Tensor([int(gestures_classes[current_gesture_idx] == x) for x in gestures_classes])
+            loss = loss_fnc(y_pred, y)
+            start = time.time()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            stop = time.time()
+
+            # print time and loss
+            print('****************** '
+                  f'Fine tuning time: {stop - start} '
+                  f'Loss: {loss:.4f} '
+                  '******************')
+
+
+
             # Save model
             torch.save({'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict()}, model_path)
@@ -102,64 +87,27 @@ def on_message(client, userdata, message):
     message_as_string = str(message.payload.decode("utf-8"))
     message_as_string = ''.join(message_as_string.split())  # remove all white characters
 
-    # Decode the JSON
-    packet = json.loads(message_as_string)
+    # Preprocess the message if time for gesture change elapsed
+    if curr_gest_dur >= time_for_gest_change:
+        preprocessor.preprocess(message_as_string)
 
-    # Read number of channels
-    num_channels = packet["channels"]
-
-    # Add a number of samples to the counter
-    samples_counter += packet["packets"]
-
-    # Save data in circular buffer if time for transition elapsed
-    if curr_gest_dur > time_for_gest_change:
-        for encoded_channels in packet["data"]:
-            if len(encoded_channels) == num_channels * BASE64_BYTES_PER_SAMPLE:
-                # Decode data
-                channels_list = base64_to_list_of_channels(encoded_channels, BASE64_BYTES_PER_SAMPLE)
-                scaled_data = np.asarray(channels_list).T * SCALE_FACTOR_EMG
-                # Save decoded data to the buffer
-                buffer.push(scaled_data)
-
-    # Print the number of samples received
-    time_elapsed = time.time() - last_sampling_rate_print_time
-    if time_elapsed >= 1.0:
-
-        print("***************************")
-        print("Samples received: " + str(samples_counter))
-        print("Time from the last print: " + str(time_elapsed))
-        print("***************************")
-
-        last_sampling_rate_print_time = time.time()
-        samples_counter = 0
-
-    # If data for the window is collected
-    if buffer.get_size() >= window_length:
-
-        # get data from the buffer
-        data_from_buffer = buffer.get_window_of_data(window_length)
-        # filtering
-        expanded_data = np.concatenate((data_from_buffer,) * 3)  # triple data length for filtering
-        filtered_data = filter_signals(expanded_data, EMG_FREQUENCY)
+    # If there's a window of data collected (including stride) than get the features vector
+    if preprocessor.check_buffered_data_size():
+        features = preprocessor.get_features()  # returns 1D vector with features
+        features_2d = features.reshape((-1, constants.CHANNELS))
+        
+        # 8th channel is not connected to any electrode - copy 7th channel to it
+        features_2d[:, 7] = features_2d[:, 6]
 
         # Transpose and expand dimension because CNN input=(batch, channels, data_window)
-        training_data = np.expand_dims(filtered_data[-200:].T, axis=0)
-        # fine tuning
-        y_pred = model(torch.Tensor(training_data))
-        y = torch.Tensor([int(gestures_classes[current_gesture_idx] == x) for x in gestures_classes])
-        loss = loss_fnc(y_pred, y)
-        start = time.time()
+        training_data = np.expand_dims(features_2d.T, axis=0)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        stop = time.time()
+        # One hot label
+        label = np.array([int(gestures_classes[current_gesture_idx] == x) for x in gestures_classes])
 
-        # print time and loss
-        print('****************** '
-              f'Fine tuning time: {stop - start} '
-              f'Loss: {loss:.4f} '
-              '******************')
+        # Append to the buffer
+        buffer['features'].append(training_data)
+        buffer['labels'].append(label)
 
 
 # MQTT data
@@ -171,19 +119,24 @@ topic = "sensors/emg/data"
 # File created flag
 file_created = False
 
-# Circular buffer
+# Preprocessor
 buff_cap = 300
-buffer = CircularQueue(buff_cap)
+window = 200000
+stride = 200000
+preprocessor = EMG_Preprocessor(window, stride, buff_cap)
+
+# Lists to collect features and labels
+buffer = {'features': [], 'labels': []}
 
 # Create specified model.
-training_config_file_path = "put_emg_gestures_classification/experiment_scripts/config_template.json"
+training_config_file_path = "config_template.json"
 training_config = load_json(training_config_file_path)
 model = Resnet1D(constants.DATASET_FEATURES_SHAPE[0], constants.NB_DATASET_CLASSES,
                  training_config["nb_res_blocks"], training_config["res_block_per_expansion"],
                  training_config["base_feature_maps"])
 
 # Optimizer setup.
-base_opt = torch.optim.Adam(model.parameters(), lr=training_config["base_lr"])
+base_opt = torch.optim.Adam(model.parameters(), lr=0.1*training_config["base_lr"])
 optimizer = Lookahead(base_opt, k=5, alpha=0.5) if training_config["use_lookahead"] else base_opt
 
 # Loss function
@@ -195,6 +148,8 @@ checkpoint = torch.load(model_path)
 model.load_state_dict(checkpoint['model_state_dict'])
 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
+# TODO freeze middle layers
+
 # Ensure these layers are in training mode
 model.train()
 
@@ -204,9 +159,6 @@ time.sleep(2)
 for n in ('three', 'two', 'one'):
     os.system(f'spd-say "{n}"')
     time.sleep(1)
-
-# Window length
-window_length = 200  # ms
 
 # Script start time
 script_start_time = time.time()

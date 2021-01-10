@@ -1,4 +1,3 @@
-[submodule "put_emg_gestures_classification"]
-	path = put_emg_gestures_classification
-	url = https://github.com/RGoralewski/put_emg_gestures_classification
-	branch = engineering_thesis
+[submodule "emg"]
+	path = emg
+	url = https://bitbucket.org/ciestudents/emg_emg-classifier-api
