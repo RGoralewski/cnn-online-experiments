@@ -4,25 +4,145 @@ import os
 import numpy as np
 import sys
 import torch
-
-# TODO remove put_emg_gestures submodule and add only pegc submodule
+import os.path as osp
+from torch.utils.data import DataLoader
 
 from put_emg_gestures_classification.pegc.models import Resnet1D
 from put_emg_gestures_classification.pegc import constants
-from put_emg_gestures_classification.pegc.training.utils import load_json
+from put_emg_gestures_classification.pegc.training import _epoch_train, _validate
+from put_emg_gestures_classification.pegc.training.utils import load_json, load_full_dataset,\
+    initialize_random_seeds, mixup_batch, AverageMeter, \
+    ModelCheckpoint, save_json
 from put_emg_gestures_classification.pegc.training.lookahead import Lookahead
+from put_emg_gestures_classification.pegc.generators import PUTEEGGesturesDataset
+from put_emg_gestures_classification.pegc.training.clr import CyclicLR
 
 from emg.emglimbo import EMG_Preprocessor
 from emg.emglimbo import constants
+
+
+def load_model_for_fine_tuning(model_path: str, fine_tuning_config: dict, train_gen_len: int) -> tuple:
+    # Create specified model.
+    model = Resnet1D(constants.DATASET_FEATURES_SHAPE[0], constants.NB_DATASET_CLASSES,
+                     fine_tuning_config["nb_res_blocks"], fine_tuning_config["res_block_per_expansion"],
+                     fine_tuning_config["base_feature_maps"])
+
+    # Optimizer setup.
+    base_opt = torch.optim.Adam(model.parameters(), fine_tuning_config["base_lr"])
+    optimizer = Lookahead(base_opt, k=5, alpha=0.5) if fine_tuning_config["use_lookahead"] else base_opt
+
+    # Loss function
+    loss_fnc = torch.nn.MultiLabelSoftMarginLoss(reduction='mean')
+
+    # Load model and optimizer from checkpoint
+    checkpoint = torch.load(model_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    # TODO freeze middle layers
+
+    # Ensure these layers are in training mode
+    model.train()
+
+    # LR schedulers setup.
+    epochs_per_half_clr_cycle = 4
+    clr = CyclicLR(optimizer, base_lr=fine_tuning_config["base_lr"], max_lr=fine_tuning_config["max_lr"],
+                   step_size_up=train_gen_len * epochs_per_half_clr_cycle,
+                   mode='triangular2', cycle_momentum=False)
+    schedulers = [clr]
+
+    # Return model and optimizer
+    return model, optimizer, loss_fnc, schedulers
+
+
+def fine_tune(model_path: str, data: dict, config_file_path: str, val_split_size: float = 0.15,
+              test_split_size: float = 0.1) -> None:
+
+    # Read config from file
+    fine_tuning_config = load_json(config_file_path)
+    device = torch.device('cuda') if torch.cuda.is_available() and not fine_tuning_config["force_cpu"] \
+        else torch.device('cpu')
+
+    # Divide data to train, test and validate datasets
+    features = np.array(data["features"])
+    labels = np.array(data["labels"])
+
+    assert features.shape[0] == labels.shape[0]
+
+    val_size = val_split_size * features.shape[0]
+    test_size = test_split_size * features.shape[0]
+
+    X_train = features[val_size:-test_size]
+    y_train = labels[val_size:-test_size]
+
+    X_val = features[:val_size]
+    y_val = labels[:val_size]
+
+    X_test = features[-test_size:]
+    y_test = features[-test_size:]
+
+    # Load data to generators
+    train_dataset = PUTEEGGesturesDataset(X_train, y_train)
+    val_dataset = PUTEEGGesturesDataset(X_val, y_val)
+    test_dataset = PUTEEGGesturesDataset(X_test, y_test)
+    train_gen = DataLoader(train_dataset,
+                           batch_size=fine_tuning_config["batch_size"],
+                           shuffle=fine_tuning_config["shuffle"])
+    val_gen = DataLoader(val_dataset,
+                         batch_size=fine_tuning_config["batch_size"],
+                         shuffle=fine_tuning_config["shuffle"])
+    test_gen = DataLoader(test_dataset,
+                          batch_size=fine_tuning_config["batch_size"],
+                          shuffle=fine_tuning_config["shuffle"])
+    # Note: this data is quite simple, no additional workers will be required for loading/processing.
+
+    # Load model
+    model, optimizer, loss_fnc, schedulers = load_model_for_fine_tuning(model_path, fine_tuning_config,
+                                                                        len(train_gen))
+
+    # Temporarily - for saving stats
+    metrics = []
+    results_dir_path = f"stats_{time.time()}"
+    os.makedirs(results_dir_path, exist_ok=True)
+
+    # Fine tuning
+    start = time.time()
+    for ep in range(1, fine_tuning_config["epochs"] + 1):
+        epoch_stats = _epoch_train(model, train_gen, device, optimizer, loss_fnc, ep, fine_tuning_config["use_mixup"],
+                                   fine_tuning_config["alpha"], schedulers)
+        val_stats = _validate(model, loss_fnc, val_gen, device)
+        epoch_stats.update(val_stats)
+
+        print(f'\nEpoch {ep} train loss: {epoch_stats["loss"]:.4f}, '
+              f'val loss: {epoch_stats["val_loss"]:.5f}, val_acc: {epoch_stats["val_acc"]:.4f}')
+
+        metrics.append(epoch_stats)
+
+    # Check results on final test/holdout set:
+    test_set_stats = _validate(model, loss_fnc, test_gen, device)
+    print(f'\nFinal evaluation on test set: '
+          f'test loss: {test_set_stats["val_loss"]:.5f}, test_acc: {test_set_stats["val_acc"]:.4f}')
+
+    # Save metrics/last network/optimizer state
+    save_json(osp.join(results_dir_path, 'test_set_stats.json'), test_set_stats)
+    save_json(osp.join(results_dir_path, 'training_losses_and_metrics.json'), {'epochs_stats': metrics})
+
+    stop = time.time()
+
+    # print time and loss
+    print('****************** '
+          f'Fine tuning time: {stop - start} '
+          '******************')
+
+    # Save model
+    torch.save({'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict()}, model_path)
 
 
 def on_message(client, userdata, message):
     """Callback function
     """
     # ***** GLOBAL VARIABLES NIGHTMARE *****
-    global file_created
-    global script_start_time
-
     global gestures_classes
     global current_gesture_idx
     global current_gesture_start_time
@@ -31,11 +151,8 @@ def on_message(client, userdata, message):
 
     global preprocessor
     global buffer
-    global model
-    global optimizer
-    global loss_fnc
-
     global model_path
+    global config_file_path
     # ********* ******* ***********
 
     # Calculate duration of the current gesture
@@ -50,32 +167,8 @@ def on_message(client, userdata, message):
             print("Recording ends, unsubscribing...")
             client.loop_stop()
 
-
-            # TODO do fine tuning in the end -> epochs, test and validation dataset, etc.
-
-
-            # fine tuning
-            y_pred = model(torch.Tensor(training_data))
-            y = torch.Tensor([int(gestures_classes[current_gesture_idx] == x) for x in gestures_classes])
-            loss = loss_fnc(y_pred, y)
-            start = time.time()
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            stop = time.time()
-
-            # print time and loss
-            print('****************** '
-                  f'Fine tuning time: {stop - start} '
-                  f'Loss: {loss:.4f} '
-                  '******************')
-
-
-
-            # Save model
-            torch.save({'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict()}, model_path)
+            # Fine tune the model
+            fine_tune(model_path, buffer, config_file_path)
 
             print("Program ends...")
             sys.exit()
@@ -99,8 +192,8 @@ def on_message(client, userdata, message):
         # 8th channel is not connected to any electrode - copy 7th channel to it
         features_2d[:, 7] = features_2d[:, 6]
 
-        # Transpose and expand dimension because CNN input=(batch, channels, data_window)
-        training_data = np.expand_dims(features_2d.T, axis=0)
+        # Transpose because CNN input=(batch, channels, data_window)
+        training_data = features_2d.T
 
         # One hot label
         label = np.array([int(gestures_classes[current_gesture_idx] == x) for x in gestures_classes])
@@ -116,8 +209,9 @@ broker_data = {
 }
 topic = "sensors/emg/data"
 
-# File created flag
-file_created = False
+# Paths to model and config file
+model_path = "openbci_third_trained_model.tar"
+config_file_path = "config_fine_tuning.json"
 
 # Preprocessor
 buff_cap = 300
@@ -127,31 +221,6 @@ preprocessor = EMG_Preprocessor(window, stride, buff_cap)
 
 # Lists to collect features and labels
 buffer = {'features': [], 'labels': []}
-
-# Create specified model.
-training_config_file_path = "config_template.json"
-training_config = load_json(training_config_file_path)
-model = Resnet1D(constants.DATASET_FEATURES_SHAPE[0], constants.NB_DATASET_CLASSES,
-                 training_config["nb_res_blocks"], training_config["res_block_per_expansion"],
-                 training_config["base_feature_maps"])
-
-# Optimizer setup.
-base_opt = torch.optim.Adam(model.parameters(), lr=0.1*training_config["base_lr"])
-optimizer = Lookahead(base_opt, k=5, alpha=0.5) if training_config["use_lookahead"] else base_opt
-
-# Loss function
-loss_fnc = torch.nn.MultiLabelSoftMarginLoss(reduction='mean')
-
-# Load model and optimizer from checkpoint
-model_path = "openbci_third_trained_model.tar"
-checkpoint = torch.load(model_path)
-model.load_state_dict(checkpoint['model_state_dict'])
-optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-# TODO freeze middle layers
-
-# Ensure these layers are in training mode
-model.train()
 
 # Prepare user for tuning...
 os.system(f'spd-say "Fine tuning starts in"')
