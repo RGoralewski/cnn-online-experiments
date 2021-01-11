@@ -102,7 +102,7 @@ def on_message(client, userdata, message):
         # print time and loss
         print('****************** '
               f'Filtering and predicting time: {time.time() - start} '
-              f'PD: {gestures_classes[int(torch.argmax(y_pred))]} '
+              f'Gesture: {gestures_classes[int(torch.argmax(y_pred))]} PD: {y_pred} '
               '******************')
 
 
@@ -110,7 +110,7 @@ def on_message(client, userdata, message):
 broker_data = {
   "broker_address": "192.168.9.100"
 }
-topic = "sensors/emg/data"
+topic = "sensors/data/emg"
 
 # File created flag
 file_created = False

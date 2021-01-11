@@ -1,58 +1,39 @@
 import paho.mqtt.client as mqtt
 import time
 import os
+import os.path as osp
 import numpy as np
 import sys
 import torch
-import os.path as osp
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from put_emg_gestures_classification.pegc.models import Resnet1D
 from put_emg_gestures_classification.pegc import constants
 from put_emg_gestures_classification.pegc.training import _epoch_train, _validate
-from put_emg_gestures_classification.pegc.training.utils import load_json, load_full_dataset,\
-    initialize_random_seeds, mixup_batch, AverageMeter, \
-    ModelCheckpoint, save_json
+from put_emg_gestures_classification.pegc.training.utils import load_json, \
+    initialize_random_seeds, save_json
 from put_emg_gestures_classification.pegc.training.lookahead import Lookahead
 from put_emg_gestures_classification.pegc.generators import PUTEEGGesturesDataset
 from put_emg_gestures_classification.pegc.training.clr import CyclicLR
 
+from emg.emglimbo import constants as emgconst
 from emg.emglimbo import EMG_Preprocessor
-from emg.emglimbo import constants
+
+import matplotlib.pyplot as plt
 
 
-def load_model_for_fine_tuning(model_path: str, fine_tuning_config: dict, train_gen_len: int) -> tuple:
-    # Create specified model.
-    model = Resnet1D(constants.DATASET_FEATURES_SHAPE[0], constants.NB_DATASET_CLASSES,
-                     fine_tuning_config["nb_res_blocks"], fine_tuning_config["res_block_per_expansion"],
-                     fine_tuning_config["base_feature_maps"])
-
-    # Optimizer setup.
-    base_opt = torch.optim.Adam(model.parameters(), fine_tuning_config["base_lr"])
-    optimizer = Lookahead(base_opt, k=5, alpha=0.5) if fine_tuning_config["use_lookahead"] else base_opt
-
-    # Loss function
-    loss_fnc = torch.nn.MultiLabelSoftMarginLoss(reduction='mean')
-
+def load_model(model_path: str, model: nn.Module) -> tuple:
     # Load model and optimizer from checkpoint
     checkpoint = torch.load(model_path)
     model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return model
 
-    # TODO freeze middle layers
 
-    # Ensure these layers are in training mode
-    model.train()
-
-    # LR schedulers setup.
-    epochs_per_half_clr_cycle = 4
-    clr = CyclicLR(optimizer, base_lr=fine_tuning_config["base_lr"], max_lr=fine_tuning_config["max_lr"],
-                   step_size_up=train_gen_len * epochs_per_half_clr_cycle,
-                   mode='triangular2', cycle_momentum=False)
-    schedulers = [clr]
-
-    # Return model and optimizer
-    return model, optimizer, loss_fnc, schedulers
+def unison_shuffled_copies(a, b):
+    assert len(a) == len(b)
+    p = np.random.permutation(len(a))
+    return a[p], b[p]
 
 
 def fine_tune(model_path: str, data: dict, config_file_path: str, val_split_size: float = 0.15,
@@ -62,15 +43,26 @@ def fine_tune(model_path: str, data: dict, config_file_path: str, val_split_size
     fine_tuning_config = load_json(config_file_path)
     device = torch.device('cuda') if torch.cuda.is_available() and not fine_tuning_config["force_cpu"] \
         else torch.device('cpu')
+    initialize_random_seeds(constants.RANDOM_SEED)
 
-    # Divide data to train, test and validate datasets
+    # Load data
     features = np.array(data["features"])
     labels = np.array(data["labels"])
 
     assert features.shape[0] == labels.shape[0]
 
-    val_size = val_split_size * features.shape[0]
-    test_size = test_split_size * features.shape[0]
+    # Plot every channel to see if the signals are correct
+    plt_f = np.concatenate(np.swapaxes(features, 1, 2)).T
+    for i in range(8):
+        plt.plot(plt_f[i])
+        plt.show()
+
+    # Shuffle windows
+    features, labels = unison_shuffled_copies(features, labels)
+
+    # Divide data to train, test and validate splits
+    val_size = int(val_split_size * features.shape[0])
+    test_size = int(test_split_size * features.shape[0])
 
     X_train = features[val_size:-test_size]
     y_train = labels[val_size:-test_size]
@@ -79,7 +71,7 @@ def fine_tune(model_path: str, data: dict, config_file_path: str, val_split_size
     y_val = labels[:val_size]
 
     X_test = features[-test_size:]
-    y_test = features[-test_size:]
+    y_test = labels[-test_size:]
 
     # Load data to generators
     train_dataset = PUTEEGGesturesDataset(X_train, y_train)
@@ -96,13 +88,42 @@ def fine_tune(model_path: str, data: dict, config_file_path: str, val_split_size
                           shuffle=fine_tuning_config["shuffle"])
     # Note: this data is quite simple, no additional workers will be required for loading/processing.
 
+    # Create specified model.
+    model = Resnet1D(constants.DATASET_FEATURES_SHAPE[0], constants.NB_DATASET_CLASSES,
+                     fine_tuning_config["nb_res_blocks"], fine_tuning_config["res_block_per_expansion"],
+                     fine_tuning_config["base_feature_maps"])
+
     # Load model
-    model, optimizer, loss_fnc, schedulers = load_model_for_fine_tuning(model_path, fine_tuning_config,
-                                                                        len(train_gen))
+    model = load_model(model_path, model)
+
+    # Freeze all layers except two first (convolutional and batch normalization) and the last (fully connected)
+    for name, param in model.named_parameters():
+        if ('res_blocks.0.' in name) or ('dense' in name):
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
+    # Optimizer setup.
+    base_opt = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), fine_tuning_config["base_lr"])
+    optimizer = Lookahead(base_opt, k=5, alpha=0.5) if fine_tuning_config["use_lookahead"] else base_opt
+
+    # Loss function
+    class_shares = np.sum(y_train, axis=0) / len(y_train)
+    class_weights = 1 / class_shares
+    class_weights = class_weights / np.sum(class_weights)  # normalize to 0-1 range
+    loss_fnc = torch.nn.MultiLabelSoftMarginLoss(reduction='mean',
+                                                 weight=torch.tensor(class_weights, dtype=torch.float32).to(device))
+
+    # LR schedulers setup.
+    epochs_per_half_clr_cycle = 4
+    clr = CyclicLR(optimizer, base_lr=fine_tuning_config["base_lr"], max_lr=fine_tuning_config["max_lr"],
+                   step_size_up=len(train_gen) * epochs_per_half_clr_cycle,
+                   mode='triangular2', cycle_momentum=False)
+    schedulers = [clr]
 
     # Temporarily - for saving stats
     metrics = []
-    results_dir_path = f"stats_{time.time()}"
+    results_dir_path = f"stats_{int(time.time())}"
     os.makedirs(results_dir_path, exist_ok=True)
 
     # Fine tuning
@@ -182,32 +203,34 @@ def on_message(client, userdata, message):
 
     # Preprocess the message if time for gesture change elapsed
     if curr_gest_dur >= time_for_gest_change:
-        preprocessor.preprocess(message_as_string)
+        samples = preprocessor.preprocess(message_as_string)
+        for sample in samples:
+            preprocessor.append_to_buffer(sample)
 
-    # If there's a window of data collected (including stride) than get the features vector
-    if preprocessor.check_buffered_data_size():
-        features = preprocessor.get_features()  # returns 1D vector with features
-        features_2d = features.reshape((-1, constants.CHANNELS))
-        
-        # 8th channel is not connected to any electrode - copy 7th channel to it
-        features_2d[:, 7] = features_2d[:, 6]
+            # If there's a window of data collected (including stride) than get the features vector
+            if preprocessor.check_buffered_data_size():
+                features = preprocessor.get_features()  # returns 1D vector with features
+                features_2d = features.reshape((-1, emgconst.CHANNELS))
 
-        # Transpose because CNN input=(batch, channels, data_window)
-        training_data = features_2d.T
+                # 8th channel is not connected to any electrode - copy 7th channel to it
+                features_2d[:, 7] = features_2d[:, 6]
 
-        # One hot label
-        label = np.array([int(gestures_classes[current_gesture_idx] == x) for x in gestures_classes])
+                # Transpose because CNN input=(batch, channels, data_window)
+                training_data = features_2d.T
 
-        # Append to the buffer
-        buffer['features'].append(training_data)
-        buffer['labels'].append(label)
+                # One hot label
+                label = np.array([int(gestures_classes[current_gesture_idx] == x) for x in gestures_classes])
+
+                # Append to the buffer
+                buffer['features'].append(training_data)
+                buffer['labels'].append(label)
 
 
 # MQTT data
 broker_data = {
   "broker_address": "192.168.9.100"
 }
-topic = "sensors/emg/data"
+topic = "sensors/data/emg"
 
 # Paths to model and config file
 model_path = "openbci_third_trained_model.tar"
@@ -238,7 +261,7 @@ last_sampling_rate_print_time = script_start_time
 # List of gestures
 gestures_classes = ['idle', 'fist', 'flexion', 'extension', 'pinch_index', 'pinch_middle',
                     'pinch_ring', 'pinch_small']
-gest_duration = 3
+gest_duration = 3.5
 time_for_gest_change = 1
 
 # Current gesture
