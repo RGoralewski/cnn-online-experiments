@@ -91,8 +91,8 @@ def fine_tune(model_path: str, data: dict, config_file_path: str) -> None:
 
     # Cross validation iterations
     cross_val_it = [{'train': split_1, 'val': split_2, 'test': split_3},
-                    {'train': split_2, 'val': split_3, 'test': split_1},
-                    {'train': split_3, 'val': split_1, 'test': split_2}]
+                    {'train': split_3, 'val': split_1, 'test': split_2},
+                    {'train': split_2, 'val': split_3, 'test': split_1}]
 
     # 3-fold cross validation - learning three times
     test_accs = {'before': [], 'after': []}
@@ -190,10 +190,10 @@ def fine_tune(model_path: str, data: dict, config_file_path: str) -> None:
           '******************')
 
     # Save model
-    '''
+
     torch.save({'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict()}, model_path)
-    '''
+
 
 def on_message(client, userdata, message):
     """Callback function
@@ -272,8 +272,8 @@ model_path = "openbci_third_trained_model.tar"
 config_file_path = "config_fine_tuning.json"
 
 # Preprocessor
-buff_cap = 300
-window = 200000
+buff_cap = 400
+window = 300000
 stride = 200000
 preprocessor = EMG_Preprocessor(window, stride, buff_cap)
 
@@ -295,8 +295,8 @@ last_sampling_rate_print_time = script_start_time
 
 # List of gestures
 gestures_classes = ['idle', 'fist', 'flexion', 'extension', 'pinch_index', 'pinch_middle',
-                    'pinch_ring', 'pinch_small']
-gest_duration = 5
+                    'pinch_ring', 'pinch_small'] * 2
+gest_duration = 3.5
 time_for_gest_change = 1
 
 # Current gesture
