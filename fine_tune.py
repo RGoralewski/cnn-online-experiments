@@ -238,7 +238,7 @@ def on_message(client, userdata, message):
 
     # Preprocess the message if time for gesture change elapsed
     if curr_gest_dur >= time_for_gest_change:
-        samples = preprocessor.preprocess(message_as_string)
+        samples = preprocessor.process(message_as_string)
         for sample in samples:
             preprocessor.append_to_buffer(sample)
 
@@ -272,10 +272,9 @@ model_path = "openbci_third_trained_model.tar"
 config_file_path = "config_fine_tuning.json"
 
 # Preprocessor
-buff_cap = 400
 window = 300000
 stride = 200000
-preprocessor = EMG_Preprocessor(window, stride, buff_cap)
+preprocessor = EMG_Preprocessor(window, stride)
 
 # Lists to collect features and labels
 buffer = {'features': [], 'labels': []}

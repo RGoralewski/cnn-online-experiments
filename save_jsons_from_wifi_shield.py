@@ -42,7 +42,7 @@ def on_message(client, userdata, message):
 broker_data = {
   "broker_address": "192.168.9.100"
 }
-topic = "sensors/emg/data"
+topic = "sensors/data/emg"
 
 # File created flag
 file_created = False
