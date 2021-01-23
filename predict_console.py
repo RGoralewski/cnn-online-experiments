@@ -38,7 +38,7 @@ def on_message(client, userdata, message):
 
 # MQTT data
 broker_data = {
-  "broker_address": "192.168.9.100"
+  "broker_address": "192.168.9.119"
 }
 topic = "sensors/data/emg"
 
@@ -51,7 +51,7 @@ stride = 200000
 preprocessor = EMG_Preprocessor(window, stride)
 
 # Create classifier model
-model_path = "openbci_third_trained_model.tar"
+model_path = "emg/model.tar"
 classifier = EMG_Classifier(model_path, fake=False)
 
 # Samples counter

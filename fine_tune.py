@@ -36,7 +36,9 @@ def unison_shuffled_copies(a, b):
     return a[p], b[p]
 
 
-def fine_tune(model_path: str, data: dict, config_file_path: str) -> None:
+def fine_tune(model_path: str, data: dict, config_file_path: str, test_size: float = 0.2, val_size: float = 0.2) -> None:
+
+    start = time.time()
 
     # Read config from file
     fine_tuning_config = load_json(config_file_path)
@@ -81,116 +83,97 @@ def fine_tune(model_path: str, data: dict, config_file_path: str) -> None:
     # Shuffle windows
     features, labels = unison_shuffled_copies(features, labels)
 
-    # Prepare 3 even splits
-    first_split_end = int(features.shape[0] / 3)
-    second_split_end = int(features.shape[0] * 2 / 3)
+    # Prepare splits
+    test_length = int(features.shape[0] * test_size)
+    val_length = int(features.shape[0] * val_size)
 
-    split_1 = {'X': features[:first_split_end], 'y': labels[:first_split_end]}
-    split_2 = {'X': features[first_split_end:second_split_end], 'y': labels[first_split_end:second_split_end]}
-    split_3 = {'X': features[second_split_end:], 'y': labels[second_split_end:]}
+    train_split = {'X': features[val_length:-test_length], 'y': labels[val_length:-test_length]}
+    val_split = {'X': features[:val_length], 'y': labels[:val_length]}
+    test_split = {'X': features[-test_length:], 'y': labels[-test_length:]}
 
     # Cross validation iterations
-    cross_val_it = [{'train': split_1, 'val': split_2, 'test': split_3},
-                    {'train': split_3, 'val': split_1, 'test': split_2},
-                    {'train': split_2, 'val': split_3, 'test': split_1}]
+    splits = {'train': train_split, 'val': val_split, 'test': test_split}
 
-    # 3-fold cross validation - learning three times
-    test_accs = {'before': [], 'after': []}
-    start = time.time()
-    for it in cross_val_it:
+    # Load data to generators
+    train_dataset = PUTEEGGesturesDataset(splits['train']['X'], splits['train']['y'])
+    val_dataset = PUTEEGGesturesDataset(splits['val']['X'], splits['val']['y'])
+    test_dataset = PUTEEGGesturesDataset(splits['test']['X'], splits['test']['y'])
+    train_gen = DataLoader(train_dataset,
+                           batch_size=fine_tuning_config["batch_size"],
+                           shuffle=fine_tuning_config["shuffle"])
+    val_gen = DataLoader(val_dataset,
+                         batch_size=fine_tuning_config["batch_size"],
+                         shuffle=fine_tuning_config["shuffle"])
+    test_gen = DataLoader(test_dataset,
+                          batch_size=fine_tuning_config["batch_size"],
+                          shuffle=fine_tuning_config["shuffle"])
+    # Note: this data is quite simple, no additional workers will be required for loading/processing.
 
-        # Load data to generators
-        train_dataset = PUTEEGGesturesDataset(it['train']['X'], it['train']['y'])
-        val_dataset = PUTEEGGesturesDataset(it['val']['X'], it['val']['y'])
-        test_dataset = PUTEEGGesturesDataset(it['test']['X'], it['test']['y'])
-        train_gen = DataLoader(train_dataset,
-                               batch_size=fine_tuning_config["batch_size"],
-                               shuffle=fine_tuning_config["shuffle"])
-        val_gen = DataLoader(val_dataset,
-                             batch_size=fine_tuning_config["batch_size"],
-                             shuffle=fine_tuning_config["shuffle"])
-        test_gen = DataLoader(test_dataset,
-                              batch_size=fine_tuning_config["batch_size"],
-                              shuffle=fine_tuning_config["shuffle"])
-        # Note: this data is quite simple, no additional workers will be required for loading/processing.
+    # Loss function
+    class_shares = np.sum(splits['train']['y'], axis=0) / len(splits['train']['y'])
+    class_weights = 1 / class_shares
+    class_weights = class_weights / np.sum(class_weights)  # normalize to 0-1 range
+    loss_fnc = torch.nn.MultiLabelSoftMarginLoss(reduction='mean',
+                                                 weight=torch.tensor(class_weights, dtype=torch.float32).to(device))
 
-        # Loss function
-        class_shares = np.sum(it['train']['y'], axis=0) / len(it['train']['y'])
-        class_weights = 1 / class_shares
-        class_weights = class_weights / np.sum(class_weights)  # normalize to 0-1 range
-        loss_fnc = torch.nn.MultiLabelSoftMarginLoss(reduction='mean',
-                                                     weight=torch.tensor(class_weights, dtype=torch.float32).to(device))
+    # LR schedulers setup.
+    epochs_per_half_clr_cycle = 4
+    clr = CyclicLR(optimizer, base_lr=fine_tuning_config["base_lr"], max_lr=fine_tuning_config["max_lr"],
+                   step_size_up=len(train_gen) * epochs_per_half_clr_cycle,
+                   mode='triangular2', cycle_momentum=False)
+    schedulers = [clr]
 
-        # LR schedulers setup.
-        epochs_per_half_clr_cycle = 4
-        clr = CyclicLR(optimizer, base_lr=fine_tuning_config["base_lr"], max_lr=fine_tuning_config["max_lr"],
-                       step_size_up=len(train_gen) * epochs_per_half_clr_cycle,
-                       mode='triangular2', cycle_momentum=False)
-        schedulers = [clr]
+    callbacks = []
+    if fine_tuning_config["use_early_stopping"]:
+        callbacks.append(EarlyStopping(monitor='val_loss', mode='min',
+                                       patience=fine_tuning_config["early_stopping_patience"]))
+        # Important: early stopping must be last on the list!
 
-        callbacks = []
-        if fine_tuning_config["use_early_stopping"]:
-            callbacks.append(EarlyStopping(monitor='val_loss', mode='min',
-                                           patience=fine_tuning_config["early_stopping_patience"]))
-            # Important: early stopping must be last on the list!
+    # Temporarily - for saving stats
+    metrics = []
+    results_dir_path = f"stats_{int(time.time())}"
+    os.makedirs(results_dir_path, exist_ok=True)
 
-        # Temporarily - for saving stats
-        metrics = []
-        results_dir_path = f"stats_{int(time.time())}"
-        os.makedirs(results_dir_path, exist_ok=True)
+    # Check results on test/holdout set:
+    test_set_stats = _validate(model, loss_fnc, test_gen, device)
+    print(f'\nEvaluation on test set: '
+          f'test loss: {test_set_stats["val_loss"]:.5f}, test_acc: {test_set_stats["val_acc"]:.4f}')
 
-        # Check results on test/holdout set:
-        test_set_stats = _validate(model, loss_fnc, test_gen, device)
-        print(f'\nEvaluation on test set: '
-              f'test loss: {test_set_stats["val_loss"]:.5f}, test_acc: {test_set_stats["val_acc"]:.4f}')
-        test_accs['before'].append(test_set_stats["val_acc"])
+    # Fine tuning
+    try:
+        for ep in range(1, fine_tuning_config["epochs"] + 1):
+            epoch_stats = _epoch_train(model, train_gen, device, optimizer, loss_fnc, ep, fine_tuning_config["use_mixup"],
+                                       fine_tuning_config["alpha"], schedulers)
+            val_stats = _validate(model, loss_fnc, val_gen, device)
+            epoch_stats.update(val_stats)
 
-        # Fine tuning
-        try:
-            for ep in range(1, fine_tuning_config["epochs"] + 1):
-                epoch_stats = _epoch_train(model, train_gen, device, optimizer, loss_fnc, ep, fine_tuning_config["use_mixup"],
-                                           fine_tuning_config["alpha"], schedulers)
-                val_stats = _validate(model, loss_fnc, val_gen, device)
-                epoch_stats.update(val_stats)
+            print(f'\nEpoch {ep} train loss: {epoch_stats["loss"]:.4f}, '
+                  f'val loss: {epoch_stats["val_loss"]:.5f}, val_acc: {epoch_stats["val_acc"]:.4f}')
 
-                print(f'\nEpoch {ep} train loss: {epoch_stats["loss"]:.4f}, '
-                      f'val loss: {epoch_stats["val_loss"]:.5f}, val_acc: {epoch_stats["val_acc"]:.4f}')
+            metrics.append(epoch_stats)
+            for cb in callbacks:
+                cb.on_epoch_end(ep, epoch_stats)
+    except EarlyStoppingSignal as e:
+        print(e)
 
-                metrics.append(epoch_stats)
-                for cb in callbacks:
-                    cb.on_epoch_end(ep, epoch_stats)
-        except EarlyStoppingSignal as e:
-            print(e)
+    # Check results on final test/holdout set:
+    test_set_stats = _validate(model, loss_fnc, test_gen, device)
+    print(f'\nFinal evaluation on test set: '
+          f'test loss: {test_set_stats["val_loss"]:.5f}, test_acc: {test_set_stats["val_acc"]:.4f}')
 
-        # Check results on final test/holdout set:
-        test_set_stats = _validate(model, loss_fnc, test_gen, device)
-        print(f'\nFinal evaluation on test set: '
-              f'test loss: {test_set_stats["val_loss"]:.5f}, test_acc: {test_set_stats["val_acc"]:.4f}')
-
-        # Append test stats to the lists
-        test_accs['after'].append(test_set_stats["val_acc"])
-
-        # Save metrics/last network/optimizer state
-        save_json(osp.join(results_dir_path, 'test_set_stats.json'), test_set_stats)
-        save_json(osp.join(results_dir_path, 'training_losses_and_metrics.json'), {'epochs_stats': metrics})
+    # Save metrics/last network/optimizer state
+    save_json(osp.join(results_dir_path, 'test_set_stats.json'), test_set_stats)
+    save_json(osp.join(results_dir_path, 'training_losses_and_metrics.json'), {'epochs_stats': metrics})
 
     stop = time.time()
-
-    # Calculate mean accuracy in the end
-    mean_acc_b4 = np.mean(test_accs['before'])
-    std_acc_b4 = np.std(test_accs['before'])
-    mean_acc_aft = np.mean(test_accs['after'])
-    std_acc_aft = np.std(test_accs['after'])
 
     # print time and loss
     print('******************\n'
           f'Fine tuning time: {stop - start}\n'
-          f'Mean acc before: {mean_acc_b4}, Acc std before: {std_acc_b4}\n'
-          f'Mean acc after: {mean_acc_aft}, Acc std after: {std_acc_aft}\n'
+          f'Mean acc before: {test_set_stats["val_acc"]}\n'
           '******************')
 
     # Save model
-
     torch.save({'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict()}, model_path)
 
@@ -294,7 +277,7 @@ last_sampling_rate_print_time = script_start_time
 
 # List of gestures
 gestures_classes = ['idle', 'fist', 'flexion', 'extension', 'pinch_index', 'pinch_middle',
-                    'pinch_ring', 'pinch_small'] * 2
+                    'pinch_ring', 'pinch_small']
 gest_duration = 3.5
 time_for_gest_change = 1
 
