@@ -15,6 +15,16 @@ def handler(event, sender, data, **args):
     if event is drone.EVENT_FLIGHT_DATA:
         print(data)
 
+
+def stop_drone():
+    global drone
+    drone.forward(0)
+    drone.up(0)
+    drone.down(0)
+    drone.counter_clockwise(0)
+    drone.clockwise(0)
+
+
 def on_message(client, userdata, message):
     """Callback function
     """
@@ -58,31 +68,28 @@ def on_message(client, userdata, message):
                     in_the_air = False
 
             # Palm landing
+            '''
             if memory.count('pinch thumb-ring') == 5:
                 if in_the_air:
                     drone.palm_land()
                     in_the_air = False
+            '''
 
             # Move
             dynamism = 30
             if memory[-1] == memory[-2]:
                 if memory[-1] == 'fist':
                     drone.forward(dynamism)
-                elif memory[-1] == 'pinch thumb-index':
-                    drone.up(dynamism)
-                elif memory[-1] == 'pinch thumb-middle':
-                    drone.down(dynamism)
+                #elif memory[-1] == 'pinch thumb-index':
+                #    drone.up(dynamism)
+                #elif memory[-1] == 'pinch thumb-middle':
+                #    drone.down(dynamism)
                 elif memory[-1] == 'flexion':
                     drone.counter_clockwise(dynamism)
                 elif memory[-1] == 'extension':
                     drone.clockwise(dynamism)
                 else:
-                    drone.forward(0)
-                    drone.up(0)
-                    drone.down(0)
-                    drone.counter_clockwise(0)
-                    drone.clockwise(0)
-
+                    stop_drone()
 
 
 # MQTT data

@@ -246,17 +246,17 @@ def on_message(client, userdata, message):
 
 # MQTT data
 broker_data = {
-  "broker_address": "192.168.9.100"
+  "broker_address": "192.168.9.119"
 }
 topic = "sensors/data/emg"
 
 # Paths to model and config file
-model_path = "openbci_third_trained_model.tar"
+model_path = "emg/model.tar"
 config_file_path = "config_fine_tuning.json"
 
 # Preprocessor
 window = 300000
-stride = 200000
+stride = 300000
 preprocessor = EMG_Preprocessor(window, stride)
 
 # Lists to collect features and labels

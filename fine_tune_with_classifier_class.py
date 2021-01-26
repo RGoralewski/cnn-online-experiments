@@ -60,8 +60,8 @@ def on_message(client, userdata, message):
             if preprocessor.check_buffered_data_size():
                 features = preprocessor.get_features()  # returns 1D vector with features
 
-                # One hot label
-                label = np.array([int(gestures_classes[current_gesture_idx] == x) for x in gestures_classes][:8])
+                # Label
+                label = gestures_classes[current_gesture_idx]
 
                 # Append to the buffer
                 buffer['features'].append(features)
@@ -70,7 +70,7 @@ def on_message(client, userdata, message):
 
 # MQTT data
 broker_data = {
-  "broker_address": "192.168.9.100"
+  "broker_address": "192.168.9.119"
 }
 topic = "sensors/data/emg"
 
@@ -94,8 +94,8 @@ for n in ('three', 'two', 'one'):
     time.sleep(1)
 
 # List of gestures
-gestures_classes = ['idle', 'fist', 'flexion', 'extension', 'pinch_index', 'pinch_middle',
-                    'pinch_ring', 'pinch_small'] * 2
+gestures_classes = ['idle', 'fist', 'flexion', 'extension', 'pinch_thumb-index',
+                    'pinch_thumb-middle', 'pinch_thumb-ring', 'pinch_thumb-small']
 gest_duration = 3.5
 time_for_gest_change = 1
 
